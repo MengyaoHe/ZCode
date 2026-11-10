@@ -17,7 +17,7 @@ jobs:
       run:
         shell: bash
     env:
-      EXPECTED_SCRIPT_SHA256: 59cdf393e9cfae6e43dbcb1f145df223aad075096e2388f698c09c1a10f2c245
+      EXPECTED_SCRIPT_SHA256: 1810e5c3fcdf49d11b3d39d9decefeae0fc24b56884bf40292963d69973bc96a
       EXPECTED_SOURCE_SHA256: 257dbfe9062ac8b28a99c7c7c5850b080220dfc77d574706bb10d472ae99be36
       ZCODE_COMMIT: a9fe401eede6e6e5e01be9048679c206fe6f02d9
       # Verified 2026-11-10: this legacy tarball SHA matches the official source package.

@@ -56,6 +56,15 @@ else
   fi
   exit "$bootstrap_status"
 fi
+# This deliverable targets Web. Omit the standalone TUI asset collector.
+node --input-type=module <<'JS'
+import { readFileSync, writeFileSync } from "node:fs";
+const path = "scripts/build-zcode.mjs";
+const source = readFileSync(path, "utf8");
+const stage = "  await stageTuiRuntime(packageRoot);";
+if (source.split(stage).length !== 2) throw new Error("Unexpected TUI staging call");
+writeFileSync(path, source.replace(stage, "  // Standalone TUI omitted for Web deployment."));
+JS
 pnpm build:zcode --base-url https://downloads.example.com/zcode/
 
 version=$(node -p "require('./dist/zcode/latest.json').version")
