@@ -1,0 +1,172 @@
+# Copy this file to .github/workflows/build-zcode-arm64.yml
+# Manual trigger only. Builds official zai-org/ZCode at a fixed public commit
+# with the unmodified diagnostic build script placed at the repository root.
+name: Build ZCode linux ARM64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      EXPECTED_SCRIPT_SHA256: 59cdf393e9cfae6e43dbcb1f145df223aad075096e2388f698c09c1a10f2c245
+      EXPECTED_SOURCE_SHA256: 257dbfe9062ac8b28a99c7c7c5850b080220dfc77d574706bb10d472ae99be36
+      ZCODE_COMMIT: a9fe401eede6e6e5e01be9048679c206fe6f02d9
+      # Verified 2026-11-10: this legacy tarball SHA matches the official source package.
+      # Do not use /archive/<sha>.tar.gz; that URL produces a different hash.
+      ZCODE_SOURCE_URL: https://codeload.github.com/zai-org/ZCode/legacy.tar.gz/a9fe401eede6e6e5e01be9048679c206fe6f02d9
+    steps:
+      - name: Confirm ARM64 runner
+        run: |
+          set -euo pipefail
+          uname -a
+          test "$(uname -m)" = aarch64
+
+      - name: Checkout build script only
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            build-zcode-arm64.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Verify build script SHA-256
+        run: |
+          set -euo pipefail
+          test -f build-zcode-arm64.sh
+          printf '%s  %s\n' "${EXPECTED_SCRIPT_SHA256}" build-zcode-arm64.sh | sha256sum -c -
+
+      - name: Download and verify official source archive
+        run: |
+          set -euo pipefail
+          curl -sS -L --fail -o ZCode-official-source.tar.gz "${ZCODE_SOURCE_URL}"
+          printf '%s  %s\n' "${EXPECTED_SOURCE_SHA256}" ZCode-official-source.tar.gz | sha256sum -c -
+
+      - name: Setup Node.js 24.14.0
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "24.14.0"
+
+      - name: Enable pnpm 10.33.2
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@10.33.2 --activate
+          test "$(node --version)" = "v24.14.0"
+          test "$(pnpm --version)" = "10.33.2"
+
+      - name: Build with official script
+        id: build
+        run: |
+          set +e
+          set -o pipefail
+          bash build-zcode-arm64.sh 2>&1 | tee build-zcode-arm64.log
+          pipeline_ec=$? ps0=${PIPESTATUS[0]} ps1=${PIPESTATUS[1]}
+          {
+            echo "pipeline_ec=${pipeline_ec}"
+            echo "PIPESTATUS[0]=${ps0}"
+            echo "PIPESTATUS[1]=${ps1}"
+          } | tee build-exit.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          log = Path("build-zcode-arm64.log")
+          text = log.read_text(errors="replace") if log.exists() else ""
+          lines = text.splitlines()
+          keys = (
+              "ERR_PNPM_PATCH_FAILED", "ERR_PNPM_", "ERR_MODULE_NOT_FOUND",
+              "GLIBC_", "malloc()", "SIGSEGV", "ELIFECYCLE",
+              "Error:", "ERROR:", "fatal:", "failed with code",
+          )
+          start = next((i for i, l in enumerate(lines) if any(k in l for k in keys)), None)
+          out = []
+          if start is None:
+              out.append("No explicit error pattern found; last 80 lines follow.")
+              out.extend(lines[-80:])
+          else:
+              out.extend(lines[start:])
+          diag = next((i for i, l in enumerate(lines) if "[diagnostic]" in l), None)
+          if diag is not None and (start is None or diag > start):
+              if start is not None and diag > start:
+                  pass
+              else:
+                  out.append("")
+                  out.extend(lines[diag:])
+          Path("first-error.txt").write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+          PY
+          exit "${pipeline_ec}"
+
+      - name: Start Web on 127.0.0.1 and verify HTTP
+        if: success()
+        run: |
+          set -euo pipefail
+          test -f zcode-linux-arm64.tar.gz
+          test -f zcode-linux-arm64.tar.gz.sha256
+          sha256sum -c zcode-linux-arm64.tar.gz.sha256
+          mkdir -p web-extract web-workspace
+          tar -xzf zcode-linux-arm64.tar.gz -C web-extract
+          test -f web-extract/zcode/bin/zcode.mjs
+          : > web-server.log
+          node web-extract/zcode/bin/zcode.mjs --web \
+            --host 127.0.0.1 --port 3030 \
+            --workspace "${PWD}/web-workspace" \
+            --no-open --no-token \
+            >web-server.log 2>&1 &
+          WEB_PID=$!
+          cleanup() {
+            if kill -0 "${WEB_PID}" 2>/dev/null; then
+              kill "${WEB_PID}" 2>/dev/null || true
+              wait "${WEB_PID}" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+          ok=0
+          for i in $(seq 1 45); do
+            if ! kill -0 "${WEB_PID}" 2>/dev/null; then
+              echo "Web process exited before HTTP success"
+              cat web-server.log || true
+              exit 1
+            fi
+            code=$(curl -sS -o web-page.html -w '%{http_code}' --max-time 5 http://127.0.0.1:3030/ || true)
+            if [ "${code}" = "200" ] && [ -s web-page.html ]; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          test "${ok}" = 1
+          kill -0 "${WEB_PID}"
+          echo "HTTP 200 from http://127.0.0.1:3030/ ; web pid ${WEB_PID} still running"
+          wc -c web-page.html
+          cleanup
+          trap - EXIT
+
+      - name: Upload release artifacts
+        if: success()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: zcode-linux-arm64
+          path: |
+            zcode-linux-arm64.tar.gz
+            zcode-linux-arm64.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Upload logs and first error
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: build-zcode-arm64-logs
+          path: |
+            build-zcode-arm64.log
+            first-error.txt
+            build-exit.txt
+            web-server.log
+            web-page.html
+          if-no-files-found: warn
